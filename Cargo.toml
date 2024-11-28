@@ -31,6 +31,11 @@ anyhow = { version = "*"}
 clap = { version = "4.5.21", default-features = false, features = ["std", "derive", "env", "help", "error-context", "usage", "wrap_help", "color", "suggestions"]}
 tracing-log = { version = "0.2"}
 tracing-subscriber = { version = "0.3.18", default-features = false, features = ["ansi", "env-filter", "fmt"]}
+#slatedb
+slatedb = "*"
+bytes = "*"
+object_store = "*"
+async-stream = "0.3.6"
 
 [[bin]]
 name = "flight_sql_client"

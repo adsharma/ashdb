@@ -16,6 +16,7 @@
 // under the License.
 
 use futures::stream::BoxStream;
+use futures::TryStreamExt;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -24,9 +25,19 @@ use arrow_flight::{
     ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo, HandshakeRequest,
     HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
+use async_stream::stream;
+
+// slatedb
+use bytes::Bytes;
+use slatedb::config::DbOptions;
+use slatedb::db::Db;
+use slatedb::object_store::{local::LocalFileSystem, ObjectStore};
+use std::sync::Arc;
 
 #[derive(Clone)]
-pub struct FlightServiceImpl {}
+pub struct FlightServiceImpl {
+    kv_store: Arc<Db>,
+}
 
 #[tonic::async_trait]
 impl FlightService for FlightServiceImpl {
@@ -77,14 +88,71 @@ impl FlightService for FlightServiceImpl {
         &self,
         _request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
-        Err(Status::unimplemented("Implement do_get"))
+        let descriptor = _request.into_inner();
+
+        // Extract the key from the FlightDescriptor
+        let key = descriptor.ticket.clone();
+
+        // Get the value from the key-value store
+        let value = match self.kv_store.get(&key).await {
+            Ok(v) => v,
+            // TODO: better err handling
+            Err(_) => None,
+        };
+
+        // Create a stream for the response
+        let response_stream = async_stream::stream! {
+            // Create FlightData with the retrieved value
+            let flight_data = FlightData {
+                flight_descriptor: Some(FlightDescriptor {
+                    r#type: 0, // Default type
+                    path: vec![], // TODO: Use key as path
+                    cmd: vec![].into(), // Optional command
+                }),
+                data_header: vec![].into(), // Optional headers
+                data_body: value.unwrap(), // Actual value
+                ..Default::default()
+            };
+
+            yield Ok(flight_data);
+        };
+
+        Ok(Response::new(Box::pin(response_stream)))
     }
 
     async fn do_put(
         &self,
         _request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
-        Err(Status::unimplemented("Implement do_put"))
+        // Create a stream for processing and responding
+        let response_stream = async_stream::stream! {
+                    let mut stream = _request.into_inner();
+                    let mut processed_count = 0;
+                    let mut error_count = 0;
+
+                    while let Some(flight_data) = stream.try_next().await? {
+                        // Assuming FlightData has key in headers and value in data_body
+                        let key = flight_data.data_header;
+                        let value = flight_data.data_body;
+/*
+                        match self.kv_store.put(&key, &value).await {
+                            Ok(_) => processed_count += 1,
+                            Err(_) => error_count += 1,
+                        }
+*/
+                    }
+
+                    // Yield a summary PutResult
+                    yield Ok(PutResult {
+                        app_metadata: format!(
+                            "Processed: {}, Errors: {}",
+                            processed_count,
+                            error_count
+                        ).into_bytes().into(),
+                    });
+                };
+
+        Ok(Response::new(Box::pin(response_stream)))
     }
 
     async fn do_action(
@@ -112,7 +180,12 @@ impl FlightService for FlightServiceImpl {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "[::1]:50051".parse()?;
-    let service = FlightServiceImpl {};
+
+    // Setup
+    let object_store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+    let options = DbOptions::default();
+    let kv_store = Arc::new(Db::open_with_opts("/tmp/test_kv_store", options, object_store).await?);
+    let service = FlightServiceImpl { kv_store };
 
     let svc = FlightServiceServer::new(service);
 
