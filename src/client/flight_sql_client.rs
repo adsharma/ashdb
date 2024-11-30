@@ -193,7 +193,7 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    setup_logging(args.logging_args)?;
+    // setup_logging(args.logging_args)?;
     let mut client = setup_client(args.client_args)
         .await
         .context("setup client")?;

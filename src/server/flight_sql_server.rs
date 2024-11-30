@@ -19,13 +19,21 @@ use futures::stream::BoxStream;
 use futures::TryStreamExt;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
+use std::net::{SocketAddrV4, Ipv4Addr};
+
 
 use arrow_flight::{
     flight_service_server::FlightService, flight_service_server::FlightServiceServer, Action,
     ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo, HandshakeRequest,
     HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
+use arrow_flight::encode::FlightDataEncoderBuilder;
+use arrow_array::record_batch;
+use arrow_schema;
+use arrow::record_batch::RecordBatch;
+
 use async_stream::stream;
+use arrow_flight::error::FlightError;
 
 // slatedb
 use bytes::Bytes;
@@ -95,29 +103,18 @@ impl FlightService for FlightServiceImpl {
 
         // Get the value from the key-value store
         let value = match self.kv_store.get(&key).await {
-            Ok(v) => v,
+            Ok(v) => if let Some(v1) = v { v1 } else {Bytes::from(vec![])},
             // TODO: better err handling
-            Err(_) => None,
+            Err(_) => Bytes::from(vec![])
         };
-
-        // Create a stream for the response
-        let response_stream = async_stream::stream! {
-            // Create FlightData with the retrieved value
-            let flight_data = FlightData {
-                flight_descriptor: Some(FlightDescriptor {
-                    r#type: 0, // Default type
-                    path: vec![], // TODO: Use key as path
-                    cmd: vec![].into(), // Optional command
-                }),
-                data_header: vec![].into(), // Optional headers
-                data_body: value.unwrap(), // Actual value
-                ..Default::default()
-            };
-
-            yield Ok(flight_data);
+        // TODO: use non hard coded key/value here
+        let item = record_batch!(("key", Int32, [1, 2, 3]), ("value", Utf8, ["a", "b", "c"]));
+        let stream = async_stream::stream!{
+            yield item.map_err(|e| FlightError::from(e))
         };
+        let fd = FlightDataEncoderBuilder::new().build(stream).map_err(|e| Status::internal(e.to_string()));
 
-        Ok(Response::new(Box::pin(response_stream)))
+        Ok(Response::new(Box::pin(fd)))
     }
 
     async fn do_put(
@@ -179,7 +176,7 @@ impl FlightService for FlightServiceImpl {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = "[::1]:50051".parse()?;
+    let addr: SocketAddrV4 = "0.0.0.0:50051".parse()?;
 
     // Setup
     let object_store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
@@ -189,7 +186,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let svc = FlightServiceServer::new(service);
 
-    Server::builder().add_service(svc).serve(addr).await?;
-
+    Server::builder().add_service(svc).serve(addr.into()).await?;
     Ok(())
 }

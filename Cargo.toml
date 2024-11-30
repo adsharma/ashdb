@@ -21,6 +21,7 @@ edition = "2021"
 
 [dependencies]
 arrow-flight = { version ="*", features = ["flight-sql-experimental", "tls", "cli"] }
+arrow = {version = "53.3.0"}
 arrow-array = {version = "53.3.0"}
 arrow-cast = {version = "53.3.0"}
 arrow-schema = {version = "53.3.0"}
