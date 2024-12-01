@@ -122,6 +122,7 @@ impl FlightService for FlightServiceImpl {
         _request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
         // Create a stream for processing and responding
+        let db = self.kv_store.clone();
         let response_stream = async_stream::stream! {
                     let mut stream = _request.into_inner();
                     let mut processed_count = 0;
@@ -131,12 +132,10 @@ impl FlightService for FlightServiceImpl {
                         // Assuming FlightData has key in headers and value in data_body
                         let key = flight_data.data_header;
                         let value = flight_data.data_body;
-/*
-                        match self.kv_store.put(&key, &value).await {
+                        match db.put(&key, &value).await {
                             Ok(_) => processed_count += 1,
                             Err(_) => error_count += 1,
                         }
-*/
                     }
 
                     // Yield a summary PutResult
