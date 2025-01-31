@@ -19,7 +19,7 @@ use futures::stream::BoxStream;
 use futures::TryStreamExt;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
-use std::net::{SocketAddrV4, Ipv4Addr};
+use std::net::SocketAddrV4;
 
 
 use arrow_flight::{
@@ -30,9 +30,7 @@ use arrow_flight::{
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_array::record_batch;
 use arrow_schema;
-use arrow::record_batch::RecordBatch;
 
-use async_stream::stream;
 use arrow_flight::error::FlightError;
 
 // slatedb
