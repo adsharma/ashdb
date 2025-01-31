@@ -1,48 +1,55 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
-
-use futures::stream::BoxStream;
-use futures::TryStreamExt;
-use tonic::transport::Server;
-use tonic::{Request, Response, Status, Streaming};
-use std::net::SocketAddrV4;
-
-
-use arrow_flight::{
-    flight_service_server::FlightService, flight_service_server::FlightServiceServer, Action,
-    ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo, HandshakeRequest,
-    HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
+use arrow::{
+    array::StringArray,
+    datatypes::{DataType, Field, Schema},
+    ipc,
+    record_batch::RecordBatch,
 };
-use arrow_flight::encode::FlightDataEncoderBuilder;
-use arrow_array::record_batch;
-use arrow_schema;
-
-use arrow_flight::error::FlightError;
-
-// slatedb
+use arrow_flight::{
+    flight_service_server::{FlightService, FlightServiceServer},
+    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
+    HandshakeRequest, HandshakeResponse, IpcMessage, PollInfo, PutResult, SchemaAsIpc,
+    SchemaResult, Ticket,
+};
+use async_stream::stream;
 use bytes::Bytes;
-use slatedb::config::DbOptions;
-use slatedb::db::Db;
-use slatedb::object_store::{local::LocalFileSystem, ObjectStore};
-use std::sync::Arc;
+use futures::stream::BoxStream;
+use futures::StreamExt;
+use std::collections::HashMap;
+use std::{net::SocketAddrV4, sync::Arc};
+use tokio::sync::Mutex;
+use tonic::{transport::Server, Request, Response, Status, Streaming};
 
-#[derive(Clone)]
-pub struct FlightServiceImpl {
-    kv_store: Arc<Db>,
+use arrow::ipc::writer::IpcWriteOptions;
+use arrow::ipc::writer::StreamWriter;
+
+struct FlightServiceImpl {
+    kv_store: Arc<Mutex<HashMap<String, Bytes>>>,
+    server_location: arrow_flight::Location, // Store the server's location here
+}
+
+fn record_batch_to_flight_data(
+    record_batch: RecordBatch,
+) -> Result<FlightData, Box<dyn std::error::Error>> {
+    // Create an IPC writer
+    let options = IpcWriteOptions::default();
+    let mut writer =
+        StreamWriter::try_new_with_options(Vec::new(), &record_batch.schema(), options)?;
+
+    // Write the RecordBatch to the IPC stream
+    writer.write(&record_batch)?;
+    writer.finish()?;
+
+    // Get the serialized data
+    let serialized_data = writer.into_inner()?;
+
+    // Create FlightData
+    let flight_data = FlightData {
+        data_header: Bytes::from(record_batch.schema().as_ref().to_string()), // Serialize schema
+        data_body: Bytes::from(serialized_data), // Serialized RecordBatch data
+        ..Default::default()
+    };
+
+    Ok(flight_data)
 }
 
 #[tonic::async_trait]
@@ -73,7 +80,51 @@ impl FlightService for FlightServiceImpl {
         &self,
         _request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        Err(Status::unimplemented("Implement get_flight_info"))
+        // Define the schema for the key-value table
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+
+        // Lock the kv_store to access the data
+        let mut kv_store = self.kv_store.lock().await;
+
+        kv_store.insert("key1".to_string(), Bytes::from("value1"));
+        kv_store.insert("key2".to_string(), Bytes::from("value2"));
+
+        // Calculate total_records (number of keys in the HashMap)
+        let total_records = kv_store.len() as i64;
+
+        // Calculate total_bytes (sum of the lengths of all Bytes values)
+        let total_bytes: i64 = kv_store.values().map(|bytes| bytes.len() as i64).sum();
+
+        // Create a ticket for querying the kvstore
+        let ticket = Ticket {
+            ticket: Bytes::from_static(b"kvstore"), // Identifier for the kvstore
+        };
+
+        // Define the endpoint for the kvstore
+        let endpoint = FlightEndpoint {
+            ticket: Some(ticket),
+            location: vec![self.server_location.clone()], // Add locations if needed
+            expiration_time: None,
+            app_metadata: Bytes::new(),
+        };
+
+        // Create a FlightInfo object describing the table
+        let flight_info = FlightInfo {
+            schema: IpcMessage::try_from(SchemaAsIpc::new(&schema, &IpcWriteOptions::default()))
+                .map_err(|e| Status::internal(e.to_string()))?
+                .0,
+            flight_descriptor: Some(_request.into_inner()),
+            endpoint: vec![endpoint], // Add endpoints if needed
+            ordered: false,
+            app_metadata: bytes::Bytes::new(),
+            total_records: total_records,
+            total_bytes: total_bytes,
+        };
+
+        Ok(Response::new(flight_info))
     }
 
     async fn poll_flight_info(
@@ -92,59 +143,94 @@ impl FlightService for FlightServiceImpl {
 
     async fn do_get(
         &self,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
-        let descriptor = _request.into_inner();
+        let ticket = request.into_inner();
 
-        // Extract the key from the FlightDescriptor
-        let key = descriptor.ticket.clone();
+        // Extract the key from the ticket
+        let key = String::from_utf8(ticket.ticket.to_vec())
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
-        // Get the value from the key-value store
-        let value = match self.kv_store.get(&key).await {
-            Ok(v) => if let Some(v1) = v { v1 } else {Bytes::from(vec![])},
-            // TODO: better err handling
-            Err(_) => Bytes::from(vec![])
+        // Fetch the value from the key-value store
+        let kv_store = self.kv_store.lock().await;
+        let value = kv_store.get(&key).cloned().unwrap_or_default();
+
+        // Create a RecordBatch with the key and value
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+
+        let key_array = StringArray::from(vec![key]);
+        let value_array =
+            StringArray::from(vec![String::from_utf8(value.to_vec()).unwrap_or_default()]);
+
+        let record_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(key_array), Arc::new(value_array)],
+        )
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+        // Serialize the RecordBatch into FlightData
+        let flight_data = record_batch_to_flight_data(record_batch)
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        // Create a stream with the FlightData
+        let stream = stream! {
+            yield Ok(flight_data);
         };
-        // TODO: use non hard coded key/value here
-        let item = record_batch!(("key", Int32, [1, 2, 3]), ("value", Utf8, ["a", "b", "c"]));
-        let stream = async_stream::stream!{
-            yield item.map_err(|e| FlightError::from(e))
-        };
-        let fd = FlightDataEncoderBuilder::new().build(stream).map_err(|e| Status::internal(e.to_string()));
-
-        Ok(Response::new(Box::pin(fd)))
+        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn do_put(
         &self,
         _request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
-        // Create a stream for processing and responding
-        let db = self.kv_store.clone();
+        let mut stream = _request.into_inner();
+        let kv_store = self.kv_store.clone();
+
         let response_stream = async_stream::stream! {
-                    let mut stream = _request.into_inner();
-                    let mut processed_count = 0;
-                    let mut error_count = 0;
+            let mut processed_count = 0;
+            let mut error_count = 0;
 
-                    while let Some(flight_data) = stream.try_next().await? {
-                        // Assuming FlightData has key in headers and value in data_body
-                        let key = flight_data.data_header;
-                        let value = flight_data.data_body;
-                        match db.put(&key, &value).await {
-                            Ok(_) => processed_count += 1,
-                            Err(_) => error_count += 1,
-                        }
+            while let Some(flight_data) = stream.next().await {
+                match flight_data {
+                    Ok(data) => {
+                        // Parse the FlightData into a RecordBatch
+                        let mut reader = arrow::ipc::reader::StreamReader::try_new(data.data_body.as_ref(), None)
+                            .map_err(|e| Status::internal(e.to_string()))?;
+                        let record_batch = reader.next()
+                            .ok_or_else(|| Status::internal("No record batch found"))?
+                            .map_err(|e| Status::internal(e.to_string()))?;
+
+                        // Extract key and value from the RecordBatch
+                        let key_array = record_batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+                        let value_array = record_batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+
+                        let key = key_array.value(0).to_string();
+                        let value = Bytes::from(value_array.value(0).to_string());
+
+                        // Store the key-value pair
+                        let mut kv_store = kv_store.lock().await;
+                        kv_store.insert(key, value);
+                        processed_count += 1;
                     }
+                    Err(e) => {
+                        error_count += 1;
+                        yield Err(e);
+                    }
+                }
+            }
 
-                    // Yield a summary PutResult
-                    yield Ok(PutResult {
-                        app_metadata: format!(
-                            "Processed: {}, Errors: {}",
-                            processed_count,
-                            error_count
-                        ).into_bytes().into(),
-                    });
-                };
+            // Yield a summary PutResult
+            yield Ok(PutResult {
+                app_metadata: format!(
+                    "Processed: {}, Errors: {}",
+                    processed_count,
+                    error_count
+                ).into_bytes().into(),
+            });
+        };
 
         Ok(Response::new(Box::pin(response_stream)))
     }
@@ -176,13 +262,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr: SocketAddrV4 = "0.0.0.0:50051".parse()?;
 
     // Setup
-    let object_store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
-    let options = DbOptions::default();
-    let kv_store = Arc::new(Db::open_with_opts("/tmp/test_kv_store", options, object_store).await?);
-    let service = FlightServiceImpl { kv_store };
+    let service = FlightServiceImpl {
+        kv_store: Arc::new(Mutex::new(HashMap::new())),
+        server_location: arrow_flight::Location {
+            uri: format!("grpc://{}", addr).into(),
+        },
+    };
 
     let svc = FlightServiceServer::new(service);
 
-    Server::builder().add_service(svc).serve(addr.into()).await?;
+    Server::builder()
+        .add_service(svc)
+        .serve(addr.into())
+        .await?;
     Ok(())
 }
