@@ -112,17 +112,13 @@ impl FlightService for FlightServiceImpl {
         };
 
         // Create a FlightInfo object describing the table
-        let flight_info = FlightInfo {
-            schema: IpcMessage::try_from(SchemaAsIpc::new(&schema, &IpcWriteOptions::default()))
-                .map_err(|e| Status::internal(e.to_string()))?
-                .0,
-            flight_descriptor: Some(_request.into_inner()),
-            endpoint: vec![endpoint], // Add endpoints if needed
-            ordered: false,
-            app_metadata: bytes::Bytes::new(),
-            total_records: total_records,
-            total_bytes: total_bytes,
-        };
+        let flight_info = FlightInfo::new()
+            .try_with_schema(&schema)
+            .expect("Encoding failed")
+            .with_endpoint(endpoint)
+            .with_descriptor(_request.into_inner())
+            .with_total_records(total_records)
+            .with_total_bytes(total_bytes);
 
         Ok(Response::new(flight_info))
     }
